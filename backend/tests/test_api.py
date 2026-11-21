@@ -223,3 +223,24 @@ def test_cors_allows_frontend_origin(client):
         },
     )
     assert r.headers.get("access-control-allow-origin") == "http://localhost:3000"
+
+
+def test_real_provider_error_fails_over(client, monkeypatch):
+    """Not simulated: key_1's provider itself returns 429 (quota), the Router moves to key_2."""
+    import litellm
+    import httpx
+    from tests import conftest
+
+    async def flaky(**kwargs):
+        if kwargs.get("api_key") == "test-key-one":
+            raise litellm.RateLimitError(
+                message="RESOURCE_EXHAUSTED: quota exceeded", llm_provider="gemini", model=kwargs["model"],
+                response=httpx.Response(429, request=httpx.Request("POST", "https://x")),
+            )
+        return await conftest.fake_acompletion(**kwargs)
+
+    monkeypatch.setattr(litellm, "acompletion", flaky)
+    r = chat(client, sid(), "quota test")
+    assert r.status_code == 200
+    assert r.json()["metadata"]["key_id"] == "key_2"
+    assert r.json()["metadata"]["fallback_attempts"] == 1

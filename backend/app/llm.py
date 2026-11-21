@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import httpx
 import litellm
+from litellm import Router
 from litellm.caching.caching import Cache
 
 from .config import KeySlot, Settings
@@ -52,12 +53,18 @@ def simulated_error(status: int, slot: KeySlot) -> Exception:
     resp = httpx.Response(status, request=httpx.Request("POST", "https://simulated.local"))
     kwargs = dict(message=msg, llm_provider=provider, model=slot.model, response=resp)
     if status == 429:
-        return litellm.RateLimitError(**kwargs)
+        return _copy_safe(litellm.RateLimitError(**kwargs))
     if status == 502:
-        return litellm.BadGatewayError(**kwargs)
+        return _copy_safe(litellm.BadGatewayError(**kwargs))
     if status == 503:
-        return litellm.ServiceUnavailableError(**kwargs)
-    return litellm.InternalServerError(**kwargs)
+        return _copy_safe(litellm.ServiceUnavailableError(**kwargs))
+    return _copy_safe(litellm.InternalServerError(**kwargs))
+
+
+def _copy_safe(exc: Exception) -> Exception:
+    # Router deep-copies its model_list; exceptions cannot be deep-copied, so copy returns itself.
+    exc.__deepcopy__ = lambda memo: exc
+    return exc
 
 
 class Gateway:
@@ -67,6 +74,31 @@ class Gateway:
         # LiteLLM in-memory cache (this LiteLLM release no longer ships a disk cache).
         self.cache = Cache(type="local", default_in_memory_ttl=settings.cache_ttl_seconds)
         self.cache_enabled = True
+        self.by_id = {slot.key_id: slot for slot in self.pool}
+        self.router = self._build_router({}) if self.pool else None
+
+    # ---- key pool (LiteLLM Router) ---------------------------------------------
+    def _build_router(self, simulate: dict[str, int]) -> Router:
+        """One Router deployment per key, chained with fallbacks in pool order.
+
+        With a simulation header, a per-request Router is built where each listed key's
+        deployment carries `mock_response=<provider-style error>`, so LiteLLM raises it
+        exactly where a real provider error would surface, for this request only.
+        """
+        model_list = []
+        for slot in self.pool:
+            params = {"model": slot.model, "api_key": slot.api_key, "timeout": self.settings.request_timeout}
+            status = simulate.get(slot.key_id, simulate.get("*"))
+            if status:
+                params["mock_response"] = simulated_error(status, slot)
+            model_list.append({"model_name": slot.key_id, "litellm_params": params, "model_info": {"id": slot.key_id}})
+        ids = [s.key_id for s in self.pool]
+        return Router(
+            model_list=model_list,
+            fallbacks=[{ids[0]: ids[1:]}] if len(ids) > 1 else [],
+            num_retries=0,  # never retry a failing key; move to the next one
+            disable_cooldowns=True,  # every request starts on key_1 (simulated failures must not leak)
+        )
 
     # ---- cache ---------------------------------------------------------------
     def cache_key(self, model: str, messages: list[dict]) -> str:
@@ -100,47 +132,43 @@ class Gateway:
                         fallback_attempts=0,
                     )
 
-        failures = 0
-        for slot in self.pool:
-            status = simulate.get(slot.key_id, simulate.get("*"))
-            try:
-                resp = await litellm.acompletion(
-                    model=slot.model,
-                    messages=messages,
-                    api_key=slot.api_key,
-                    timeout=self.settings.request_timeout,
-                    max_tokens=self.settings.max_output_tokens,
-                    num_retries=0,  # fail over to the next key instead of retrying this one
-                    mock_response=simulated_error(status, slot) if status else None,
-                )
-                reply = (resp.choices[0].message.content or "").strip()
-                if not reply:
-                    raise ValueError("empty completion")
-            except Exception as exc:  # 429 / quota / 5xx / timeout / bad key -> next key
-                failures += 1
-                log.warning("key %s failed (%s): %s", slot.key_id, type(exc).__name__, str(exc)[:200])
-                continue
-
-            usage = getattr(resp, "usage", None)
-            input_tokens = getattr(usage, "prompt_tokens", None)
-            output_tokens = getattr(usage, "completion_tokens", None)
-            if input_tokens is None:
-                input_tokens = litellm.token_counter(model=slot.model, messages=messages)
-            if output_tokens is None:
-                output_tokens = litellm.token_counter(model=slot.model, text=reply)
-
-            entry = {
-                "reply": reply,
-                "model": slot.model,
-                "input_tokens": int(input_tokens),
-                "output_tokens": int(output_tokens),
-            }
-            self._cache_put(slot.model, messages, entry)
-            return Completion(
-                **entry,
-                resolution_source="LIVE_INFERENCE",
-                key_id=slot.key_id,
-                fallback_attempts=failures,
+        router = self.router if not simulate else self._build_router(simulate)
+        try:
+            # LiteLLM Router: starts on key_1 and walks the fallback chain key_2, key_3, ...
+            resp = await router.acompletion(
+                model=self.pool[0].key_id,
+                messages=messages,
+                max_tokens=self.settings.max_output_tokens,
             )
+        except Exception as exc:  # every key failed (429 / quota / 5xx / timeout / bad key)
+            log.warning("all keys failed (%s): %s", type(exc).__name__, str(exc)[:200])
+            raise AllProvidersUnavailable() from exc
 
-        raise AllProvidersUnavailable()
+        key_id = (resp._hidden_params or {}).get("model_id") or self.pool[0].key_id
+        slot = self.by_id.get(key_id, self.pool[0])
+        reply = (resp.choices[0].message.content or "").strip()
+        if not reply:
+            raise AllProvidersUnavailable()
+
+        usage = getattr(resp, "usage", None)
+        input_tokens = getattr(usage, "prompt_tokens", None)
+        output_tokens = getattr(usage, "completion_tokens", None)
+        if input_tokens is None:
+            input_tokens = litellm.token_counter(model=slot.model, messages=messages)
+        if output_tokens is None:
+            output_tokens = litellm.token_counter(model=slot.model, text=reply)
+
+        entry = {
+            "reply": reply,
+            "model": slot.model,
+            "input_tokens": int(input_tokens),
+            "output_tokens": int(output_tokens),
+        }
+        self._cache_put(slot.model, messages, entry)
+        return Completion(
+            **entry,
+            resolution_source="LIVE_INFERENCE",
+            key_id=slot.key_id,
+            # The chain is ordered, so every key before the one that answered has failed.
+            fallback_attempts=self.pool.index(slot),
+        )

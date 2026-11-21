@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  backend-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r backend/requirements.txt -r backend/requirements-dev.txt
+      - run: cd backend && python -m pytest -q
+
+  make-up:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: make up (copies .env.example to .env, builds multi-stage images, starts both services)
+        run: make up
+      - name: backend on :8000 and frontend on :3000
+        run: |
+          for i in $(seq 1 30); do curl -sf http://localhost:8000/health && break; sleep 2; done
+          curl -sf http://localhost:8000/health | grep '"keys_configured":2'
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST localhost:8000/chat -H 'Content-Type: application/json' -d '{"session_id":"s","message":"  "}')" = 422
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8000/sessions/unknown/messages)" = 404
+          curl -sf http://localhost:3000 | grep -q '<div id="root">'
+          curl -sf http://localhost:3000/config.js | grep -q 'http://localhost:8000'
+      - name: SQLite file lives in the named volume at /data and survives a restart
+        run: |
+          docker compose exec -T backend ls -la /data/app.db
+          make down
+          make up
+          for i in $(seq 1 30); do curl -sf http://localhost:8000/health && break; sleep 2; done
+          docker volume ls | grep chat_data
+          docker compose exec -T backend ls -la /data/app.db
+      - name: image sizes
+        run: docker images --format '{{.Repository}} {{.Size}}' | grep -i -E 'backend|frontend'
+      - if: always()
+        run: docker compose logs --no-color | tail -50
+      - if: always()
+        run: make down
