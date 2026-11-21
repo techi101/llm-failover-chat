@@ -1,5 +1,7 @@
 # LLM Chatbot with Key Failover and Response Caching
 
+[![ci](https://github.com/techi101/llm-failover-chat/actions/workflows/ci.yml/badge.svg)](https://github.com/techi101/llm-failover-chat/actions/workflows/ci.yml)
+
 A small full-stack AI chat app: **React** frontend, **FastAPI** backend, **LiteLLM** gateway with a key pool and automatic failover, LiteLLM's built-in **response cache**, and **SQLite** session storage. Every reply shows where it came from (`LIVE_INFERENCE` or `LLM_CACHE`), the model, the latency and the input/output tokens of that request only.
 
 ```
@@ -50,6 +52,8 @@ Both Dockerfiles are multi-stage:
 - **backend**: `python:3.12-slim` builder creates a virtualenv; the runtime stage copies only the venv and `app/`, runs as a non-root user, and has a `HEALTHCHECK` on `/health`.
 - **frontend**: `node:22-alpine` builds the Vite bundle; the runtime stage is `nginx:alpine` serving static files on port 3000. The backend URL comes from the `API_URL` env var at container start (written to `/config.js`), so one image works against any backend.
 
+**Verified in CI** (`.github/workflows/ci.yml`, every push): on a clean Ubuntu runner it runs `make up`, then checks backend `:8000/health` (2 keys, cache on), a 422 and a 404, the frontend on `:3000` and its runtime `config.js`. It confirms `/data/app.db` sits in the `chat_data` volume and survives `make down && make up`. Image sizes: frontend 74 MB (nginx:alpine), backend about 700 MB, almost all of it LiteLLM's own dependencies.
+
 ### Without Docker
 
 ```bash
@@ -59,7 +63,7 @@ python -m venv .venv && . .venv/bin/activate      # Windows: .venv\Scripts\activ
 pip install -r requirements.txt -r requirements-dev.txt
 export LLM_API_KEYS=key-one,key-two DATABASE_URL=sqlite:///./data/app.db ENABLE_FAILURE_SIMULATION=true
 uvicorn app.main:app --port 8000
-pytest -q                                         # 25 tests, no network or real keys needed
+pytest -q                                         # 26 tests, no network or real keys needed
 
 # frontend (new terminal)
 cd frontend
@@ -85,9 +89,10 @@ VITE_API_URL=http://localhost:8000 npm run dev    # http://localhost:5173
 ### Key fallback
 
 - The pool is built from `LLM_API_KEYS`; each entry becomes a `KeySlot(key_id, model, api_key)`. The secret never leaves that object: responses, logs and `/health` only ever show `key_1`, `key_2`, ...
-- `backend/app/llm.py` walks the pool in order and calls `litellm.acompletion(..., api_key=slot.api_key, num_retries=0)`. LiteLLM normalises every provider's errors into typed exceptions (`RateLimitError` for 429 and quota exhaustion, `InternalServerError`, `BadGatewayError`, `ServiceUnavailableError`, timeouts, connection errors). Any of these moves on to the next key immediately, with no retry on the failing key, because a rate-limited key will stay rate-limited for this request.
-- `fallback_attempts` counts the keys that failed before the one that answered. If every key fails, the API returns `503 {"detail": "all providers unavailable"}` and **nothing is written** to history: the user and assistant messages are saved together in one transaction only after a successful reply.
-- **Failover test hook.** With `ENABLE_FAILURE_SIMULATION=true`, `X-Simulate-Failure: key_1=429,key_2=500` (or `*=429`) is parsed per request. For each listed key the gateway passes LiteLLM's `mock_response=<RateLimitError | InternalServerError | BadGatewayError | ServiceUnavailableError>`, so the failure is raised *inside LiteLLM's own call path* exactly like a real provider error, and handled by the same failover code. The next key then makes a real call, so a simulated request always returns a real answer. Invalid pairs are ignored, and the header is ignored when the switch is off.
+- `backend/app/llm.py` builds a **LiteLLM `Router`** with one deployment per key (`model_name` = `key_1`, `key_2`, ...; `model_info.id` = the key id) and a fallback chain `key_1 → key_2 → ... → key_n`. Settings: `num_retries=0` (never retry a key that just failed; move on) and `disable_cooldowns=True` (every request starts on key_1, so the order is deterministic and a simulated failure never leaks into later requests). A per-key `timeout` (12 s) turns a hanging provider into a quick failover.
+- LiteLLM normalises every provider's errors into typed exceptions (`RateLimitError` for 429 and quota exhaustion, `InternalServerError`, `BadGatewayError`, `ServiceUnavailableError`, timeouts, connection and auth errors). The Router falls back on any of them. The answering key comes from `response._hidden_params["model_id"]`.
+- `fallback_attempts` counts the keys that failed before the one that answered. The chain is ordered, so that is the answering key's position in the pool. If every key fails, the API returns `503 {"detail": "all providers unavailable"}` and **nothing is written** to history: the user and assistant messages are saved together in one transaction only after a successful reply.
+- **Failover test hook.** With `ENABLE_FAILURE_SIMULATION=true`, `X-Simulate-Failure: key_1=429,key_2=500` (or `*=429`) is parsed per request, and a short-lived Router is built for that request in which each listed key's deployment carries LiteLLM's `mock_response=<RateLimitError | InternalServerError | BadGatewayError | ServiceUnavailableError>` with the exact status. LiteLLM raises it *inside its own call path*, exactly where a real provider error would surface, and the Router's normal fallback logic handles it. Keys not listed make real calls, so a simulated request always returns a real answer. Invalid pairs are ignored, and the header is ignored when the switch is off. (Checked: building these Routers adds no global LiteLLM callbacks, so nothing leaks between requests.)
 - A request carrying a simulation header **skips the cache read** (it still writes the cache). Otherwise a previously cached message would answer with `key_id: null` and the failover could not be demonstrated.
 - Every error is JSON with a `detail` field: validation (422), unknown session (404), all keys down (503), and a catch-all handler (500) that logs the trace server-side and never returns it.
 
@@ -148,7 +153,7 @@ curl -s $B/sessions/unknown/messages                                            
 
 **Tokens** are per request, as reported by the provider that answered (Gemini and Groq tokenise differently, so a reply served by key_2 after a failover reports that provider's counts): `input_tokens` is the prompt of that call (system + history + new message) and grows as the conversation grows; `output_tokens` is that reply only. Two equal-length first messages in new sessions report about the same `input_tokens`.
 
-**Tests**: `cd backend && pytest -q` runs 25 tests covering the contract shape, cache hit/miss rules (history and system prompt in the key, identical reply, stored tokens, faster hit), multi-turn and session isolation, per-request tokens, every failover case including 502/503 and `*`, 503 writes nothing, simulation off, all 422 cases, 404 and CORS. LiteLLM runs in mock mode, so no network or real keys are needed.
+**Tests**: `cd backend && pytest -q` runs 26 tests covering the contract shape, cache hit/miss rules (history and system prompt in the key, identical reply, stored tokens, faster hit), multi-turn and session isolation, per-request tokens, every failover case including 502/503 and `*`, a real (non-simulated) provider quota error, 503 writes nothing, simulation off, all 422 cases, 404 and CORS. LiteLLM runs in mock mode, so no network or real keys are needed.
 
 ## 5. Setup Used
 
