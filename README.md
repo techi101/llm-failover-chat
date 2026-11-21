@@ -20,6 +20,7 @@ React (Vite)  ──POST /chat──▶  FastAPI ──▶ LiteLLM Cache (model 
 | Health | https://llm-failover-chat-api.vercel.app/health |
 | API docs (Swagger) | https://llm-failover-chat-api.vercel.app/docs |
 | Repository | https://github.com/techi101/llm-failover-chat |
+| Demo video | https://llm-failover-chat-demo.vercel.app (MP4 also on the v1.0 release) |
 
 `ENABLE_FAILURE_SIMULATION=true` is set on the deployed backend, so the `X-Simulate-Failure` hook works live.
 
