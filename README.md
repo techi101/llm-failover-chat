@@ -23,6 +23,15 @@ React (Vite)  ──POST /chat──▶  FastAPI ──▶ LiteLLM Cache (model 
 
 `ENABLE_FAILURE_SIMULATION=true` is set on the deployed backend, so the `X-Simulate-Failure` hook works live.
 
+**Deployed key pool** (two keys on two providers, so failover also survives a whole-provider outage):
+
+| Key id | LiteLLM model | Provider |
+|---|---|---|
+| `key_1` | `gemini/gemini-3.1-flash-lite` | Google AI Studio |
+| `key_2` | `groq/openai/gpt-oss-120b` | Groq |
+
+key_1 was picked after timing current Gemini models: flash-lite is a stable release that answers in about 1–3 s. A per-key timeout of 12 s means a hanging provider fails over quickly instead of making the user wait.
+
 ## 2. Run locally: with Docker and without
 
 ### With Docker (recommended)
@@ -62,7 +71,7 @@ VITE_API_URL=http://localhost:8000 npm run dev    # http://localhost:5173
 | Variable | Meaning |
 |---|---|
 | `LLM_API_KEYS` | Comma-separated key pool (at least 2). Ids are `key_1`, `key_2`, ... in this order. |
-| `LLM_MODEL` | LiteLLM model name, default `gemini/gemini-2.5-flash`. |
+| `LLM_MODEL` | LiteLLM model name, default `gemini/gemini-3.1-flash-lite`. |
 | `LLM_KEY_MODELS` | Optional, one model per key (same order) to mix models or providers in one pool. |
 | `DATABASE_URL` | SQLite location, e.g. `sqlite:////data/app.db`. |
 | `ALLOWED_ORIGINS` | Comma-separated CORS origins. |
@@ -136,7 +145,7 @@ curl -s $B/sessions/unknown/messages                                            
 
 **In the UI**: every assistant reply shows the source badge (blue `LIVE_INFERENCE`, green `LLM_CACHE`), model, latency in ms, input and output tokens, the key id, and a "failover" badge when `fallback_attempts > 0`. Open **Settings → Failover lab** to attach `X-Simulate-Failure` to the next messages. **View stored history** calls `GET /sessions/{id}/messages`. Reload the page for a new session and send the same first message to see a cache hit. Errors (422/503/network) appear as a readable red message in the chat.
 
-**Tokens** are per request: `input_tokens` is the prompt of that call (system + history + new message) and grows as the conversation grows; `output_tokens` is that reply only. Two equal-length first messages in new sessions report about the same `input_tokens`.
+**Tokens** are per request, as reported by the provider that answered (Gemini and Groq tokenise differently, so a reply served by key_2 after a failover reports that provider's counts): `input_tokens` is the prompt of that call (system + history + new message) and grows as the conversation grows; `output_tokens` is that reply only. Two equal-length first messages in new sessions report about the same `input_tokens`.
 
 **Tests**: `cd backend && pytest -q` runs 25 tests covering the contract shape, cache hit/miss rules (history and system prompt in the key, identical reply, stored tokens, faster hit), multi-turn and session isolation, per-request tokens, every failover case including 502/503 and `*`, 503 writes nothing, simulation off, all 422 cases, 404 and CORS. LiteLLM runs in mock mode, so no network or real keys are needed.
 

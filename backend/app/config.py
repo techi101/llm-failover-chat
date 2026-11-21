@@ -43,7 +43,7 @@ class Settings:
 
 
 def load_settings() -> Settings:
-    model = os.getenv("LLM_MODEL", "gemini/gemini-2.5-flash").strip()
+    model = os.getenv("LLM_MODEL", "gemini/gemini-3.1-flash-lite").strip()
     keys = _csv("LLM_API_KEYS")
     # Optional: give each key its own model (same order as LLM_API_KEYS).
     per_key_models = _csv("LLM_KEY_MODELS")
@@ -65,7 +65,7 @@ def load_settings() -> Settings:
             "You are a helpful, concise assistant. Answer clearly and keep replies short unless asked for detail.",
         ),
         cache_ttl_seconds=float(os.getenv("LLM_CACHE_TTL_SECONDS", "86400")),
-        request_timeout=float(os.getenv("LLM_TIMEOUT_SECONDS", "30")),
+        request_timeout=float(os.getenv("LLM_TIMEOUT_SECONDS", "12")),
         max_output_tokens=int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "1024")),
         key_pool=pool,
     )

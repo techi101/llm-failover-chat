@@ -33,7 +33,7 @@ async def fake_acompletion(**kwargs):
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'app.db'}")
     monkeypatch.setenv("LLM_API_KEYS", "test-key-one,test-key-two")
-    monkeypatch.setenv("LLM_MODEL", "gemini/gemini-2.5-flash")
+    monkeypatch.setenv("LLM_MODEL", "gemini/gemini-3.1-flash-lite")
     monkeypatch.setenv("ENABLE_FAILURE_SIMULATION", "true")
     monkeypatch.setenv("ALLOWED_ORIGINS", "http://localhost:3000")
     monkeypatch.setattr(litellm, "acompletion", fake_acompletion)

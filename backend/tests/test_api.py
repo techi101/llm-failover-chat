@@ -29,7 +29,7 @@ def test_chat_contract(client):
     assert body["reply"]
     m = body["metadata"]
     assert m["resolution_source"] == "LIVE_INFERENCE"
-    assert m["model"] == "gemini/gemini-2.5-flash"
+    assert m["model"] == "gemini/gemini-3.1-flash-lite"
     assert isinstance(m["latency_ms"], int)
     assert isinstance(m["input_tokens"], int) and isinstance(m["output_tokens"], int)
     assert m["key_id"] == "key_1"
