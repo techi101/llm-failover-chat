@@ -43,7 +43,7 @@ class Settings:
 
 
 def load_settings() -> Settings:
-    model = os.getenv("LLM_MODEL", "gemini/gemini-3.1-flash-lite").strip()
+    model = os.getenv("LLM_MODEL", "groq/openai/gpt-oss-120b").strip()
     keys = _csv("LLM_API_KEYS")
     # Optional: give each key its own model (same order as LLM_API_KEYS).
     per_key_models = _csv("LLM_KEY_MODELS")

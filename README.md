@@ -26,14 +26,15 @@ React (Vite)  ──POST /chat──▶  FastAPI ──▶ LiteLLM Cache (model 
 
 `ENABLE_FAILURE_SIMULATION=true` is set on the deployed backend, so the `X-Simulate-Failure` hook works live.
 
-**Deployed key pool** (two keys on two providers, so failover also survives a whole-provider outage):
+**Deployed key pool** (two providers, so failover also survives a whole-provider outage):
 
 | Key id | LiteLLM model | Provider |
 |---|---|---|
-| `key_1` | `gemini/gemini-3.1-flash-lite` | Google AI Studio |
-| `key_2` | `groq/openai/gpt-oss-120b` | Groq |
+| `key_1` | `groq/openai/gpt-oss-120b` | Groq |
+| `key_2` | `gemini/gemini-3.5-flash-lite` | Google AI Studio |
+| `key_3` | `gemini/gemini-flash-lite-latest` | Google AI Studio (same Google key as key_2, different model) |
 
-key_1 was picked after timing current Gemini models: flash-lite is a stable release that answers in about 1–3 s. A per-key timeout of 12 s means a hanging provider fails over quickly instead of making the user wait.
+Why this order: I timed the candidates from the deployed backend. Groq answered every request in about 0.3–0.6 s, so it takes normal traffic. Gemini models were sometimes "high demand" (503) or slow, which is exactly what the fallback chain is for. key_3 reuses the Google key on a second Gemini model, so one overloaded Gemini model does not turn a key_1 failover into a 503. A per-key timeout of 12 s keeps a hanging provider from stalling the user.
 
 ## 2. Run locally: with Docker and without
 
@@ -76,7 +77,7 @@ VITE_API_URL=http://localhost:8000 npm run dev    # http://localhost:5173
 | Variable | Meaning |
 |---|---|
 | `LLM_API_KEYS` | Comma-separated key pool (at least 2). Ids are `key_1`, `key_2`, ... in this order. |
-| `LLM_MODEL` | LiteLLM model name, default `gemini/gemini-3.1-flash-lite`. |
+| `LLM_MODEL` | LiteLLM model name used by keys without an entry in `LLM_KEY_MODELS`, default `groq/openai/gpt-oss-120b`. |
 | `LLM_KEY_MODELS` | Optional, one model per key (same order) to mix models or providers in one pool. |
 | `DATABASE_URL` | SQLite location, e.g. `sqlite:////data/app.db`. |
 | `ALLOWED_ORIGINS` | Comma-separated CORS origins. |
@@ -124,12 +125,12 @@ VITE_API_URL=http://localhost:8000 npm run dev    # http://localhost:5173
 B=https://llm-failover-chat-api.vercel.app
 
 curl $B/health
-# {"status":"ok","keys_configured":2,"cache_enabled":true}
+# {"status":"ok","keys_configured":3,"cache_enabled":true,"keys":[{"key_id":"key_1","model":"groq/openai/gpt-oss-120b"},...]}
 
 # Cache: same first message in two new sessions
 curl -s -X POST $B/chat -H 'Content-Type: application/json' -d '{"session_id":"s-a1","message":"What is the capital of France?"}'
 curl -s -X POST $B/chat -H 'Content-Type: application/json' -d '{"session_id":"s-b2","message":"What is the capital of France?"}'
-# 1st: "resolution_source":"LIVE_INFERENCE", key_id "key_1"
+# 1st: "resolution_source":"LIVE_INFERENCE", key_id "key_1" (Groq)
 # 2nd: "resolution_source":"LLM_CACHE", identical reply, same tokens, key_id null, much lower latency_ms
 
 # Failover
@@ -149,7 +150,7 @@ curl -s -X POST $B/chat -H 'Content-Type: application/json' -d '{"session_id":"x
 curl -s $B/sessions/unknown/messages                                                             # 404
 ```
 
-**In the UI**: every assistant reply shows the source badge (blue `LIVE_INFERENCE`, green `LLM_CACHE`), model, latency in ms, input and output tokens, the key id, and a "failover" badge when `fallback_attempts > 0`. Open **Settings → Failover lab** to attach `X-Simulate-Failure` to the next messages. **View stored history** calls `GET /sessions/{id}/messages`. Reload the page for a new session and send the same first message to see a cache hit. Errors (422/503/network) appear as a readable red message in the chat.
+**In the UI**: under every reply, a **route trace** draws the path the request took (for example `key_1 returned 429 → key_2 answered`, or `Served from cache, no key used`), followed by the source (`LIVE_INFERENCE` / `LLM_CACHE`), model, latency in ms, input and output tokens and the key id. The **Key pool** panel lists each key with its provider and model; per-key buttons (Healthy / 429 / 500 / 502 / 503) build the `X-Simulate-Failure` header for the next messages, and **Fail every key** shows the 503 path. **Show stored history** calls `GET /sessions/{id}/messages`. Reload the page for a new session and send the same first message to see a cache hit. Errors (422/503/network) appear as a readable red message in the chat.
 
 **Tokens** are per request, as reported by the provider that answered (Gemini and Groq tokenise differently, so a reply served by key_2 after a failover reports that provider's counts): `input_tokens` is the prompt of that call (system + history + new message) and grows as the conversation grows; `output_tokens` is that reply only. Two equal-length first messages in new sessions report about the same `input_tokens`.
 
@@ -161,13 +162,15 @@ curl -s $B/sessions/unknown/messages                                            
 - AI tools: Claude Code (Claude Opus) for scaffolding, code and tests, reviewed and run locally
 - Libraries: FastAPI, LiteLLM 1.110, SQLite (stdlib `sqlite3`), React 19 + Vite, marked + DOMPurify
 - Hosting: Vercel (frontend and the FastAPI backend on Vercel's Python runtime)
+- UI type: Schibsted Grotesk, with JetBrains Mono only for identifiers
 
 ## 6. Bonus features
 
-- **Failover lab in the UI**: radio buttons that attach `X-Simulate-Failure` to the next request, so failover and the 503 path can be shown without curl.
+- **Route trace on every reply**: shows which keys failed (and with what status) before one answered, or that the cache served it.
+- **Key pool panel**: each key's provider, model and answered/failed counts, with per-key failure buttons that build the `X-Simulate-Failure` header, so failover and the 503 path can be shown without curl. `/health` also returns the key ids and models (never the secrets) to drive this panel.
 - **Stored history viewer**: shows the raw `GET /sessions/{id}/messages` response from SQLite inside the app.
-- **Per-session stats**: replies, cache hits and failovers for the current session; live backend health (key count, cache on/off) in the header.
-- **Mixed-model pools**: `LLM_KEY_MODELS` lets each key use a different model or provider (for example Gemini plus Groq), so failover also works across providers.
+- **Per-chat stats**: replies, cache hits and failovers; live backend health (key count, cache on/off) in the header.
+- **Mixed-model pools**: `LLM_KEY_MODELS` lets each key use a different model or provider (for example Gemini plus Groq), so failover also works across providers (the live pool is Groq first, then Gemini).
 - **System prompt per session**: stored in SQLite and part of the cache key.
 - **Safe markdown rendering** of replies (marked + DOMPurify), dark mode, and a mobile layout with a slide-over settings panel.
 - **Runtime-configurable frontend image** (`API_URL` → `/config.js`), non-root backend container with a healthcheck.

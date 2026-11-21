@@ -6,82 +6,169 @@ import { API_URL, getHealth, getHistory, newSessionId, sendChat } from './api'
 marked.setOptions({ breaks: true, gfm: true })
 const renderMarkdown = (text) => ({ __html: DOMPurify.sanitize(marked.parse(text || '')) })
 
-const SIMULATIONS = [
-  { value: '', label: 'Off', hint: 'Normal requests' },
-  { value: 'key_1=429', label: 'key_1 → 429', hint: 'Rate limit on key 1, expect key_2' },
-  { value: 'key_1=500', label: 'key_1 → 500', hint: 'Server error on key 1, expect key_2' },
-  { value: 'key_1=429,key_2=500', label: 'key_1 429 · key_2 500', hint: 'All keys fail, expect 503' },
-  { value: '*=429', label: 'Every key → 429', hint: 'All keys fail, expect 503' },
+const FAIL_CODES = ['429', '500', '502', '503']
+const STARTERS = [
+  { text: 'What is the capital of France?', hint: 'Then reload and ask again to get a cache hit' },
+  { text: 'My name is Asha. Please remember it.', hint: 'Then ask "What is my name?"' },
+  { text: 'Explain an API rate limit in two sentences.', hint: 'A longer answer, more output tokens' },
 ]
 
-const SUGGESTIONS = ['What is the capital of France?', 'My name is Asha. Remember it.', 'What is my name?']
+const providerOf = (model = '') => {
+  const p = model.split('/')[0]
+  return { gemini: 'Google Gemini', groq: 'Groq', openai: 'OpenAI', anthropic: 'Anthropic', mistral: 'Mistral' }[p] || p
+}
+const shortModel = (model = '') => model.split('/').slice(1).join('/') || model
 
-function MetaRow({ meta }) {
-  const cached = meta.resolution_source === 'LLM_CACHE'
+// Parse 'key_1=429,*=500' into { key_1: '429', '*': '500' }
+const parseSim = (h) => Object.fromEntries((h || '').split(',').filter((p) => p.includes('=')).map((p) => p.split('=').map((x) => x.trim())))
+
+/* ---------- route trace: the path one request took through the gateway ---------- */
+function Route({ meta, simulate, keyIds }) {
+  if (meta.resolution_source === 'LLM_CACHE') {
+    return (
+      <ol className="route" aria-label="Request route">
+        <li className="hop hop-cache">
+          <span className="hop-mark" aria-hidden>
+            <svg viewBox="0 0 16 16"><path d="M3 8.5l3 3 7-7" /></svg>
+          </span>
+          Served from cache, no key used
+        </li>
+      </ol>
+    )
+  }
+  const sim = parseSim(simulate)
+  const answered = meta.key_id
+  const idx = keyIds.indexOf(answered)
+  const tried = idx >= 0 ? keyIds.slice(0, idx + 1) : [...Array(meta.fallback_attempts).fill('?'), answered]
   return (
-    <div className="meta">
-      <span className={`chip source ${cached ? 'cache' : 'live'}`} title="Resolution source">
-        <span className="dot" />
-        <span data-testid="meta-source">{meta.resolution_source}</span>
-      </span>
-      <span className="chip" title="Model used">
-        <span className="k">model</span>
-        <span data-testid="meta-model">{meta.model}</span>
-      </span>
-      <span className="chip" title="Server-measured latency">
-        <span className="k">latency</span>
-        <span data-testid="meta-latency">{meta.latency_ms} ms</span>
-      </span>
-      <span className="chip" title="Input tokens for this request only">
-        <span className="k">in</span>
-        <span data-testid="meta-input-tokens">{meta.input_tokens}</span>
-      </span>
-      <span className="chip" title="Output tokens for this reply only">
-        <span className="k">out</span>
-        <span data-testid="meta-output-tokens">{meta.output_tokens}</span>
-      </span>
-      <span className="chip subtle" title="Key that answered (never the secret)">
-        <span className="k">key</span>
-        <span data-testid="meta-key-id">{meta.key_id ?? 'null'}</span>
-      </span>
-      {meta.fallback_attempts > 0 && (
-        <span className="chip warn" title="Keys that failed before this one succeeded">
-          <span className="k">failover</span>
-          <span data-testid="meta-fallback-attempts">{meta.fallback_attempts}</span>
-        </span>
-      )}
-    </div>
+    <ol className="route" aria-label="Request route">
+      {tried.map((k, i) => {
+        const ok = k === answered
+        const code = sim[k] || sim['*']
+        return (
+          <li key={i} className={`hop ${ok ? 'hop-ok' : 'hop-fail'}`}>
+            <span className="hop-mark" aria-hidden>
+              {ok ? <svg viewBox="0 0 16 16"><path d="M3 8.5l3 3 7-7" /></svg> : <svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8" /></svg>}
+            </span>
+            <span className="hop-key">{k}</span>
+            <span className="hop-note">{ok ? 'answered' : code ? `returned ${code}` : 'failed'}</span>
+          </li>
+        )
+      })}
+    </ol>
   )
 }
 
-function Message({ m }) {
+function Reply({ m, keyIds }) {
+  const meta = m.metadata
+  const cached = meta.resolution_source === 'LLM_CACHE'
+  return (
+    <article className={`msg msg-bot ${cached ? 'is-cache' : ''}`} data-testid="assistant-message">
+      <div className="md" dangerouslySetInnerHTML={renderMarkdown(m.content)} />
+      <footer className="receipt">
+        <Route meta={meta} simulate={m.simulate} keyIds={keyIds} />
+        <dl className="facts">
+          <div className="fact fact-source">
+            <dt>Source</dt>
+            <dd>
+              <span className={`source ${cached ? 'source-cache' : 'source-live'}`} data-testid="meta-source">
+                {meta.resolution_source}
+              </span>
+            </dd>
+          </div>
+          <div className="fact fact-model">
+            <dt>Model</dt>
+            <dd className="mono" data-testid="meta-model" title={providerOf(meta.model)}>
+              {meta.model}
+            </dd>
+          </div>
+          <div className="fact">
+            <dt>Latency</dt>
+            <dd data-testid="meta-latency">{meta.latency_ms} ms</dd>
+          </div>
+          <div className="fact">
+            <dt>Input tokens</dt>
+            <dd data-testid="meta-input-tokens">{meta.input_tokens}</dd>
+          </div>
+          <div className="fact">
+            <dt>Output tokens</dt>
+            <dd data-testid="meta-output-tokens">{meta.output_tokens}</dd>
+          </div>
+          <div className="fact">
+            <dt>Key</dt>
+            <dd className="mono" data-testid="meta-key-id">{meta.key_id ?? 'null'}</dd>
+          </div>
+        </dl>
+      </footer>
+    </article>
+  )
+}
+
+function Message({ m, keyIds }) {
   if (m.role === 'user') {
     return (
-      <div className="row user">
-        <div className="bubble user-bubble" data-testid="user-message">
-          {m.content}
-          {m.simulate && <div className="sim-tag">X-Simulate-Failure: {m.simulate}</div>}
-        </div>
+      <div className="msg msg-user" data-testid="user-message">
+        <p>{m.content}</p>
+        {m.simulate && (
+          <span className="sent-header">
+            with header <code>X-Simulate-Failure: {m.simulate}</code>
+          </span>
+        )}
       </div>
     )
   }
   if (m.role === 'error') {
+    const fix =
+      m.status === 503
+        ? 'Clear the simulated failures in the gateway panel, or wait a moment and send again.'
+        : m.status === 422
+          ? 'Edit the message and send it again.'
+          : 'Check your connection and send again. A sleeping backend can take a few seconds to wake.'
     return (
-      <div className="row bot">
-        <div className="bubble error-bubble" role="alert" data-testid="error-message">
-          <strong>{m.status ? `Error ${m.status}` : 'Connection error'}</strong>
-          <span>{m.content}</span>
-        </div>
+      <div className="msg msg-error" role="alert" data-testid="error-message">
+        <strong>{m.status === 503 ? 'All providers unavailable (503)' : m.status ? `Request rejected (${m.status})` : 'Backend not reachable'}</strong>
+        <p>{m.content}</p>
+        <p className="error-fix">{fix}</p>
       </div>
     )
   }
+  return <Reply m={m} keyIds={keyIds} />
+}
+
+/* ---------- gateway panel ---------- */
+function KeyRow({ k, value, onChange, stats }) {
+  const failing = value !== 'ok'
   return (
-    <div className="row bot">
-      <div className="bubble bot-bubble" data-testid="assistant-message">
-        <div className="md" dangerouslySetInnerHTML={renderMarkdown(m.content)} />
-        <MetaRow meta={m.metadata} />
+    <li className={`key ${failing ? 'key-failing' : ''}`}>
+      <div className="key-head">
+        <span className="key-id">{k.key_id}</span>
+        <span className="key-provider">{providerOf(k.model)}</span>
       </div>
-    </div>
+      <div className="key-model mono">{shortModel(k.model)}</div>
+      <div className="key-stats">
+        <span>
+          <b>{stats.answered}</b> answered
+        </span>
+        <span>
+          <b>{stats.failed}</b> failed
+        </span>
+      </div>
+      <div className="seg" role="radiogroup" aria-label={`Simulate a failure on ${k.key_id}`}>
+        {['ok', ...FAIL_CODES].map((c) => (
+          <button
+            key={c}
+            type="button"
+            role="radio"
+            aria-checked={value === c}
+            className={`seg-btn ${value === c ? 'on' : ''} ${c === 'ok' ? 'seg-ok' : 'seg-fail'}`}
+            onClick={() => onChange(c)}
+            data-testid={`sim-${k.key_id}-${c}`}
+          >
+            {c === 'ok' ? 'Healthy' : c}
+          </button>
+        ))}
+      </div>
+    </li>
   )
 }
 
@@ -90,11 +177,12 @@ export default function App() {
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [systemPrompt, setSystemPrompt] = useState('')
-  const [simulate, setSimulate] = useState('')
+  const [sim, setSim] = useState({}) // { key_1: '429', ... }
   const [pending, setPending] = useState(false)
   const [health, setHealth] = useState(null)
   const [history, setHistory] = useState(null)
   const [panelOpen, setPanelOpen] = useState(false)
+  const [copied, setCopied] = useState(false)
   const endRef = useRef(null)
   const inputRef = useRef(null)
 
@@ -103,7 +191,7 @@ export default function App() {
     const load = () =>
       getHealth()
         .then((h) => alive && setHealth(h))
-        .catch((e) => alive && setHealth({ ok: false, error: e.message }))
+        .catch(() => alive && setHealth({ ok: false, unreachable: true }))
     load()
     const t = setInterval(load, 30000)
     return () => {
@@ -116,25 +204,48 @@ export default function App() {
     endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
   }, [messages, pending])
 
-  const totals = useMemo(() => {
-    const replies = messages.filter((m) => m.role === 'assistant')
-    return {
-      replies: replies.length,
-      cached: replies.filter((m) => m.metadata.resolution_source === 'LLM_CACHE').length,
-      failovers: replies.filter((m) => m.metadata.fallback_attempts > 0).length,
+  const keys = useMemo(() => {
+    if (health?.keys?.length) return health.keys
+    const n = health?.keys_configured || 2
+    return Array.from({ length: n }, (_, i) => ({ key_id: `key_${i + 1}`, model: '' }))
+  }, [health])
+  const keyIds = keys.map((k) => k.key_id)
+
+  const header = useMemo(
+    () =>
+      Object.entries(sim)
+        .filter(([, v]) => v && v !== 'ok')
+        .map(([k, v]) => `${k}=${v}`)
+        .join(','),
+    [sim],
+  )
+
+  const stats = useMemo(() => {
+    const s = { replies: 0, cache: 0, failovers: 0, tokensIn: 0, tokensOut: 0, perKey: {} }
+    keyIds.forEach((k) => (s.perKey[k] = { answered: 0, failed: 0 }))
+    for (const m of messages) {
+      if (m.role !== 'assistant') continue
+      const md = m.metadata
+      s.replies++
+      if (md.resolution_source === 'LLM_CACHE') s.cache++
+      if (md.fallback_attempts > 0) s.failovers++
+      if (md.key_id && s.perKey[md.key_id]) s.perKey[md.key_id].answered++
+      const idx = keyIds.indexOf(md.key_id)
+      keyIds.slice(0, Math.max(idx, 0)).forEach((k) => s.perKey[k].failed++)
     }
-  }, [messages])
+    return s
+  }, [messages, keyIds])
 
   async function send(text) {
     const message = (text ?? input).trim()
     if (!message || pending) return
     setInput('')
-    const sim = simulate
-    setMessages((ms) => [...ms, { role: 'user', content: message, simulate: sim }])
+    const h = header
+    setMessages((ms) => [...ms, { role: 'user', content: message, simulate: h }])
     setPending(true)
     try {
-      const res = await sendChat({ sessionId, message, systemPrompt, simulate: sim })
-      setMessages((ms) => [...ms, { role: 'assistant', content: res.reply, metadata: res.metadata }])
+      const res = await sendChat({ sessionId, message, systemPrompt, simulate: h })
+      setMessages((ms) => [...ms, { role: 'assistant', content: res.reply, metadata: res.metadata, simulate: h }])
     } catch (e) {
       setMessages((ms) => [...ms, { role: 'error', status: e.status, content: e.message }])
     } finally {
@@ -144,11 +255,21 @@ export default function App() {
   }
 
   async function showHistory() {
+    setHistory({ loading: true })
     try {
-      setHistory({ loading: true })
       setHistory({ data: await getHistory(sessionId) })
     } catch (e) {
-      setHistory({ error: `${e.status || ''} ${e.message}`.trim() })
+      setHistory({ error: e.status === 404 ? 'Nothing stored yet. Send a message first; failed requests are never stored.' : e.message })
+    }
+  }
+
+  const copySession = async () => {
+    try {
+      await navigator.clipboard.writeText(sessionId)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1400)
+    } catch {
+      /* clipboard blocked */
     }
   }
 
@@ -159,35 +280,38 @@ export default function App() {
     }
   }
 
-  const healthLabel = !health
-    ? 'Checking backend…'
+  const status = !health ? 'checking' : health.ok ? 'ok' : 'bad'
+  const statusText = !health
+    ? 'Connecting to backend'
     : health.ok
-      ? `Backend ok · ${health.keys_configured} keys · cache ${health.cache_enabled ? 'on' : 'off'}`
+      ? `Backend healthy, ${health.keys_configured} keys, cache ${health.cache_enabled ? 'on' : 'off'}`
       : health.detail
-        ? `Backend degraded · ${health.detail}`
-        : 'Backend unreachable'
+        ? `Backend degraded: ${health.detail}`
+        : 'Backend not reachable'
 
   return (
     <div className="app">
-      <header className="topbar">
+      <header className="bar">
         <div className="brand">
-          <span className="logo" aria-hidden>
-            <svg viewBox="0 0 24 24" width="18" height="18">
-              <path d="M4 5h16v10H9l-5 4z" fill="none" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" />
-            </svg>
-          </span>
-          <div>
-            <h1>Failover Chat</h1>
-            <p>LiteLLM key pool · response cache · SQLite sessions</p>
-          </div>
+          <svg className="brand-mark" viewBox="0 0 32 32" aria-hidden>
+            <circle cx="7" cy="16" r="4" />
+            <circle cx="25" cy="8" r="4" />
+            <circle cx="25" cy="24" r="4" />
+            <path d="M11 16h4c3 0 4-8 6-8M15 16c3 0 4 8 6 8" />
+          </svg>
+          <span className="brand-name">Failover Chat</span>
         </div>
-        <div className="top-right">
-          <span className={`status ${health?.ok ? 'ok' : health ? 'bad' : ''}`} data-testid="health-status">
-            <span className="dot" />
-            <span className="status-text">{healthLabel}</span>
+        <div className="bar-right">
+          <span className={`health health-${status}`} data-testid="health-status" title={statusText}>
+            <span className="health-dot" aria-hidden />
+            <span className="health-text">{statusText}</span>
           </span>
-          <button className="ghost panel-toggle" onClick={() => setPanelOpen((v) => !v)} aria-expanded={panelOpen}>
-            {panelOpen ? 'Close' : 'Settings'}
+          <button className="btn btn-quiet" onClick={() => window.location.reload()}>
+            New chat
+          </button>
+          <button className="btn btn-quiet panel-toggle" onClick={() => setPanelOpen((v) => !v)} aria-expanded={panelOpen} aria-controls="gateway">
+            Gateway
+            {header && <span className="pill-dot" aria-label="failures simulated" />}
           </button>
         </div>
       </header>
@@ -196,32 +320,37 @@ export default function App() {
         <main className="chat">
           <div className="scroll">
             {messages.length === 0 ? (
-              <div className="empty">
-                <h2>Ask anything.</h2>
-                <p>
-                  Each reply shows where it came from (<code>LIVE_INFERENCE</code> or <code>LLM_CACHE</code>), the model, the latency and the tokens of that
-                  request only. Send the same first message from a fresh page to see a cache hit.
+              <section className="intro">
+                <h1>Ask something. Every answer shows the route it took.</h1>
+                <p className="lede">
+                  Requests go through a pool of {keys.length} API keys. If a key is rate limited or down, the next one answers. Repeated questions come
+                  back from the cache in about a millisecond.
                 </p>
-                <div className="suggestions">
-                  {SUGGESTIONS.map((s) => (
-                    <button key={s} className="suggestion" onClick={() => send(s)}>
-                      {s}
-                    </button>
+                <ul className="starters">
+                  {STARTERS.map((s) => (
+                    <li key={s.text}>
+                      <button className="starter" onClick={() => send(s.text)}>
+                        <span className="starter-text">{s.text}</span>
+                        <span className="starter-hint">{s.hint}</span>
+                      </button>
+                    </li>
                   ))}
-                </div>
-              </div>
+                </ul>
+                <ol className="tour">
+                  <li>Send a question and look at the route under the answer.</li>
+                  <li>Click New chat, send the same question, and it comes from the cache.</li>
+                  <li>In the gateway panel, set key_1 to 429 and send again to watch it fail over.</li>
+                </ol>
+              </section>
             ) : (
               <div className="thread">
                 {messages.map((m, i) => (
-                  <Message key={i} m={m} />
+                  <Message key={i} m={m} keyIds={keyIds} />
                 ))}
                 {pending && (
-                  <div className="row bot">
-                    <div className="bubble bot-bubble typing" aria-live="polite" aria-label="Assistant is typing">
-                      <span />
-                      <span />
-                      <span />
-                    </div>
+                  <div className="msg msg-bot msg-pending" aria-live="polite">
+                    <span className="pulse" aria-hidden />
+                    {header ? `Sending with ${header}` : 'Waiting for the model'}
                   </div>
                 )}
                 <div ref={endRef} />
@@ -229,14 +358,14 @@ export default function App() {
             )}
           </div>
 
-          <div className="composer-wrap">
-            {simulate && (
-              <div className="sim-banner">
+          <div className="composer-area">
+            {header && (
+              <div className="sim-strip">
                 <span>
-                  Failure simulation on: <code>X-Simulate-Failure: {simulate}</code>
+                  Next message is sent with <code>X-Simulate-Failure: {header}</code>
                 </span>
-                <button className="link" onClick={() => setSimulate('')}>
-                  turn off
+                <button className="link" onClick={() => setSim({})}>
+                  Clear
                 </button>
               </div>
             )}
@@ -247,94 +376,117 @@ export default function App() {
                 send()
               }}
             >
+              <label htmlFor="chat-input" className="sr-only">
+                Message
+              </label>
               <textarea
+                id="chat-input"
                 ref={inputRef}
                 data-testid="chat-input"
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={onKeyDown}
-                placeholder="Message the assistant…"
+                placeholder="Write a message"
                 rows={1}
                 maxLength={4000}
                 autoFocus
               />
-              <button type="submit" data-testid="send-button" className="send" disabled={pending || !input.trim()} aria-label="Send message">
-                <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden>
-                  <path d="M5 12h13M13 6l6 6-6 6" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
+              <button type="submit" data-testid="send-button" className="send" disabled={pending || !input.trim()}>
+                Send
               </button>
             </form>
-            <div className="foot">
-              <span>Enter to send · Shift+Enter for a new line · {input.trim().length}/4000</span>
-              <span>
-                Session <code data-testid="session-id">{sessionId}</code>
-              </span>
+            <div className="composer-foot">
+              <span>Enter sends, Shift+Enter adds a line</span>
+              <span className={input.trim().length > 3800 ? 'near-limit' : ''}>{input.trim().length} / 4000</span>
             </div>
           </div>
         </main>
 
-        <aside className={`panel ${panelOpen ? 'open' : ''}`}>
-          <section>
-            <h3>System prompt</h3>
-            <p className="help">Optional. Overrides the default prompt for this session.</p>
+        <aside id="gateway" className={`panel ${panelOpen ? 'open' : ''}`} aria-label="Gateway">
+          <section className="panel-sec">
+            <div className="sec-head">
+              <h2>Key pool</h2>
+              <span className="sec-meta">tried in this order</span>
+            </div>
+            <p className="help">Make a key fail on purpose. The choice is sent as a request header, for your next messages only.</p>
+            <ol className="keys">
+              {keys.map((k) => (
+                <KeyRow
+                  key={k.key_id}
+                  k={k}
+                  value={sim[k.key_id] || 'ok'}
+                  stats={stats.perKey[k.key_id] || { answered: 0, failed: 0 }}
+                  onChange={(v) => setSim((s) => ({ ...s, [k.key_id]: v }))}
+                />
+              ))}
+            </ol>
+            <button className="btn btn-block btn-danger-quiet" onClick={() => setSim(Object.fromEntries(keyIds.map((k) => [k, '429'])))}>
+              Fail every key (expect 503)
+            </button>
+          </section>
+
+          <section className="panel-sec">
+            <h2>This chat</h2>
+            <dl className="tally">
+              <div>
+                <dt>Replies</dt>
+                <dd>{stats.replies}</dd>
+              </div>
+              <div>
+                <dt>Cache hits</dt>
+                <dd>{stats.cache}</dd>
+              </div>
+              <div>
+                <dt>Failovers</dt>
+                <dd>{stats.failovers}</dd>
+              </div>
+            </dl>
+            <div className="session-row">
+              <span>Session</span>
+              <code data-testid="session-id">{sessionId}</code>
+              <button className="link" onClick={copySession}>
+                {copied ? 'Copied' : 'Copy'}
+              </button>
+            </div>
+            <button className="btn btn-block" onClick={showHistory} data-testid="history-button">
+              Show stored history
+            </button>
+            {history && (
+              <div className="history" data-testid="history-output">
+                {history.loading && <p className="help">Loading from SQLite</p>}
+                {history.error && <p className="help">{history.error}</p>}
+                {history.data && (
+                  <>
+                    <p className="help">
+                      {history.data.messages.length} messages in SQLite, from <code>GET /sessions/{'{id}'}/messages</code>
+                    </p>
+                    <pre>{JSON.stringify(history.data, null, 2)}</pre>
+                  </>
+                )}
+              </div>
+            )}
+          </section>
+
+          <section className="panel-sec">
+            <h2>
+              <label htmlFor="system-prompt">System prompt</label>
+            </h2>
+            <p className="help">Optional. Sets the assistant's behaviour for this chat and is part of the cache key.</p>
             <textarea
+              id="system-prompt"
               data-testid="system-prompt-input"
               value={systemPrompt}
               onChange={(e) => setSystemPrompt(e.target.value)}
-              placeholder="e.g. You are a friendly travel guide. Answer in two sentences."
-              rows={4}
+              placeholder="You are a friendly travel guide. Answer in two sentences."
+              rows={3}
             />
           </section>
 
-          <section>
-            <h3>Failover lab</h3>
-            <p className="help">
-              Adds an <code>X-Simulate-Failure</code> header to your next messages.
-            </p>
-            <div className="sims" role="radiogroup" aria-label="Failure simulation">
-              {SIMULATIONS.map((s) => (
-                <label key={s.value || 'off'} className={`sim ${simulate === s.value ? 'on' : ''}`}>
-                  <input type="radio" name="sim" value={s.value} checked={simulate === s.value} onChange={() => setSimulate(s.value)} />
-                  <span className="sim-label">{s.label}</span>
-                  <span className="sim-hint">{s.hint}</span>
-                </label>
-              ))}
-            </div>
-          </section>
-
-          <section>
-            <h3>This session</h3>
-            <div className="stats">
-              <div>
-                <b>{totals.replies}</b>
-                <span>replies</span>
-              </div>
-              <div>
-                <b>{totals.cached}</b>
-                <span>cache hits</span>
-              </div>
-              <div>
-                <b>{totals.failovers}</b>
-                <span>failovers</span>
-              </div>
-            </div>
-            <button className="ghost full" onClick={showHistory} data-testid="history-button">
-              View stored history (SQLite)
-            </button>
-            {history && (
-              <pre className="history" data-testid="history-output">
-                {history.loading ? 'Loading…' : history.error ? history.error : JSON.stringify(history.data, null, 2)}
-              </pre>
-            )}
-            <button className="ghost full" onClick={() => window.location.reload()}>
-              Start a new session
-            </button>
-          </section>
-
-          <p className="api">
-            API: <code>{API_URL}</code>
+          <p className="api-note">
+            API <code>{API_URL}</code>
           </p>
         </aside>
+        {panelOpen && <button className="scrim" aria-label="Close gateway panel" onClick={() => setPanelOpen(false)} />}
       </div>
     </div>
   )

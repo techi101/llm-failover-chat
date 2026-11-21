@@ -83,7 +83,14 @@ class ChatRequest(BaseModel):
 def health():
     db_ok = db.ping()
     keys = len(settings.key_pool)
-    body = {"status": "ok", "keys_configured": keys, "cache_enabled": gateway.cache_enabled}
+    body = {
+        "status": "ok",
+        "keys_configured": keys,
+        "cache_enabled": gateway.cache_enabled,
+        # extra (allowed) field: ids and models only, never the secret
+        "keys": [{"key_id": s.key_id, "model": s.model} for s in settings.key_pool],
+        "failure_simulation": settings.enable_failure_simulation,
+    }
     if not db_ok or keys == 0:
         body["status"] = "degraded"
         body["detail"] = "database unreachable" if not db_ok else "no API keys configured"

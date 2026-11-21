@@ -16,7 +16,10 @@ def chat(client, session_id, message, headers=None, **extra):
 def test_health(client):
     r = client.get("/health")
     assert r.status_code == 200
-    assert r.json() == {"status": "ok", "keys_configured": 2, "cache_enabled": True}
+    body = r.json()
+    assert {k: body[k] for k in ("status", "keys_configured", "cache_enabled")} == {"status": "ok", "keys_configured": 2, "cache_enabled": True}
+    assert [k["key_id"] for k in body["keys"]] == ["key_1", "key_2"]
+    assert "test-key" not in r.text
 
 
 # ---- contract shape -----------------------------------------------------------

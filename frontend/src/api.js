@@ -15,7 +15,7 @@ export class ApiError extends Error {
 }
 
 function describe(status, detail) {
-  if (status === 503) return 'All providers are unavailable right now: every API key in the pool failed. Please try again in a moment.'
+  if (status === 503) return 'Every key in the pool was rate limited, out of quota or down, so nothing was saved to the chat history.'
   if (status === 422) {
     if (Array.isArray(detail)) {
       return 'Invalid request: ' + detail.map((d) => `${(d.loc || []).filter((x) => x !== 'body').join('.') || 'body'}: ${d.msg}`).join('; ')
@@ -31,7 +31,7 @@ async function request(path, options = {}) {
   try {
     res = await fetch(API_URL + path, options)
   } catch {
-    throw new ApiError(0, `Can't reach the backend at ${API_URL}. It may be waking up; please try again in a few seconds.`)
+    throw new ApiError(0, `No response from ${API_URL}.`)
   }
   let body = null
   try {
