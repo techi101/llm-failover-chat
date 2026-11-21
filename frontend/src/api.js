@@ -51,5 +51,15 @@ export function sendChat({ sessionId, message, systemPrompt, simulate }) {
   return request('/chat', { method: 'POST', headers, body: JSON.stringify(payload) })
 }
 
-export const getHealth = () => request('/health')
+export async function getHealth() {
+  // /health returns 503 with a JSON body when degraded (e.g. no keys); show that body instead of "unreachable".
+  let res
+  try {
+    res = await fetch(API_URL + '/health')
+  } catch {
+    throw new ApiError(0, 'unreachable')
+  }
+  const body = await res.json().catch(() => ({}))
+  return { ...body, ok: res.ok }
+}
 export const getHistory = (sessionId) => request(`/sessions/${encodeURIComponent(sessionId)}/messages`)

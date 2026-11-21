@@ -204,7 +204,7 @@ textarea { font: inherit; color: inherit; }
 
 /* ---- small screens ---- */
 @media (max-width: 900px) {
-  .layout { grid-template-columns: 1fr; position: relative; }
+  .layout { grid-template-columns: 1fr; position: relative; overflow: hidden; }
   .panel {
     position: absolute; inset: 0 0 0 auto; width: min(360px, 100%); z-index: 5;
     transform: translateX(100%); transition: transform 0.2s ease; box-shadow: var(--shadow);

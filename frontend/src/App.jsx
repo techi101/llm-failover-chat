@@ -102,7 +102,7 @@ export default function App() {
     let alive = true
     const load = () =>
       getHealth()
-        .then((h) => alive && setHealth({ ok: true, ...h }))
+        .then((h) => alive && setHealth(h))
         .catch((e) => alive && setHealth({ ok: false, error: e.message }))
     load()
     const t = setInterval(load, 30000)
@@ -163,7 +163,9 @@ export default function App() {
     ? 'Checking backend…'
     : health.ok
       ? `Backend ok · ${health.keys_configured} keys · cache ${health.cache_enabled ? 'on' : 'off'}`
-      : 'Backend unreachable'
+      : health.detail
+        ? `Backend degraded · ${health.detail}`
+        : 'Backend unreachable'
 
   return (
     <div className="app">
