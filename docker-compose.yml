@@ -1,0 +1,28 @@
+services:
+  backend:
+    build: ./backend
+    container_name: chat-backend
+    env_file: .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-sqlite:////data/app.db}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
+      PORT: 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - chat_data:/data
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    container_name: chat-frontend
+    environment:
+      API_URL: ${PUBLIC_API_URL:-http://localhost:8000}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  chat_data:
